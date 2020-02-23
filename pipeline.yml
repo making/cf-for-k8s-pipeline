@@ -1,0 +1,232 @@
+resources:
+- name: synchronizer
+  type: time
+  icon: autorenew
+  source:
+    interval: 1m
+- name: cf-for-k8s-master
+  type: git
+  icon: github-box
+  source:
+    uri: https://github.com/cloudfoundry/cf-for-k8s.git
+    branch: master
+    ignore_paths:
+    - ci/**
+- name: scripts
+  type: git
+  icon: github-box
+  source:
+    uri: https://gist.github.com/45f6230992f891127ddf276984914e0c.git    
+
+gcp-params: &gke
+  SERVICE_ACCOUNT: ((gke_service_account))
+  # Project Viewer
+  # Compute Viewer
+  # Kubernetes Engine Admin
+  # Service Account User
+  # DNS Administrator
+  PROJECT_ID: ((project_id))
+  REGION: asia-northeast1
+  ZONE: asia-northeast1-c
+  CLUSTER_NAME: cf-for-k8s
+  DNS_DOMAIN: ((dns_domain))
+  DNS_ZONE_NAME: ((dns_zone_name))
+
+groups:
+- name: install
+  jobs:
+  - create-cluster
+  - install-cf
+  - register-dns-record
+  - run-smoke-test
+- name: uninstall
+  jobs:
+  - uninstall-cf
+  - delete-cluster
+
+
+jobs:
+- name: create-cluster
+  plan:
+  - in_parallel:
+    - get: synchronizer
+    - get: scripts
+  - task: create-cluster
+    params:
+      <<: *gke
+    config:
+      platform: linux
+      image_resource:
+        type: docker-image
+        source:
+          repository: relintdockerhubpushbot/cf-for-k8s-ci
+      inputs:
+      - name: scripts          
+      run:
+        path: bash
+        args: 
+        - -ce
+        - |
+          bash scripts/init-gcp.sh
+          gcloud container clusters create ${CLUSTER_NAME} \
+            --cluster-version 1.15 \
+            --machine-type=n1-standard-2 \
+            --num-nodes 3 \
+            --enable-autorepair \
+            --enable-network-policy \
+            --metadata disable-legacy-endpoints=true \
+            --no-enable-autoupgrade \
+            --no-enable-stackdriver-kubernetes \
+            --preemptible
+
+- name: install-cf
+  plan:
+  - in_parallel:
+    - get: synchronizer
+      passed:
+      - create-cluster
+      trigger: true
+    - get: cf-for-k8s-master
+    - get: scripts
+  - task: install-cf
+    params:
+      <<: *gke
+      CF_ADMIN_PASSWORD: ((cf_admin_password))
+    config:
+      platform: linux
+      image_resource:
+        type: docker-image
+        source:
+          repository: relintdockerhubpushbot/cf-for-k8s-ci
+      inputs:
+      - name: cf-for-k8s-master
+      - name: scripts
+      run:
+        path: bash
+        args: 
+        - -ce
+        - |
+          bash scripts/init-gcp.sh
+          gcloud container clusters get-credentials ${CLUSTER_NAME}
+          cf-for-k8s-master/hack/confirm-network-policy.sh ${CLUSTER_NAME} ${ZONE}
+          cf-for-k8s-master/hack/generate-values.sh "${DNS_DOMAIN}" > cf-install-values.yml
+          sed -i "s/cf_admin_password: .*/cf_admin_password: ${CF_ADMIN_PASSWORD}/" cf-install-values.yml
+          cf-for-k8s-master/bin/install-cf.sh cf-install-values.yml
+          kubectl get pod -A
+
+- name: register-dns-record
+  plan:
+  - in_parallel:
+    - get: synchronizer
+      passed:
+      - install-cf
+      trigger: true
+    - get: cf-for-k8s-master
+      passed:
+      - install-cf
+    - get: scripts
+  - task: register-dns-record
+    params:
+      <<: *gke
+    config:
+      platform: linux
+      image_resource:
+        type: docker-image
+        source:
+          repository: relintdockerhubpushbot/cf-for-k8s-ci
+      inputs:
+      - name: cf-for-k8s-master
+      - name: scripts
+      run:
+        path: bash
+        args: 
+        - -ce
+        - |
+          bash scripts/init-gcp.sh
+          gcloud container clusters get-credentials ${CLUSTER_NAME}
+          cf-for-k8s-master/hack/update-gcp-dns.sh ${DNS_DOMAIN} ${DNS_ZONE_NAME}
+
+- name: run-smoke-test
+  plan:
+  - in_parallel:
+    - get: synchronizer
+      passed:
+      - register-dns-record
+      trigger: true
+    - get: cf-for-k8s-master
+      passed:
+      - register-dns-record
+    - get: scripts
+  - task: run-smoke-test
+    params:
+      SMOKE_TEST_APPS_DOMAIN: ((dns_domain))
+      SMOKE_TEST_API_ENDPOINT: https://api.((dns_domain))
+      SMOKE_TEST_USERNAME: admin
+      SMOKE_TEST_PASSWORD: ((cf_admin_password))
+    config:
+      platform: linux
+      image_resource:
+        type: docker-image
+        source:
+          repository: relintdockerhubpushbot/cf-test-runner
+      inputs:
+      - name: cf-for-k8s-master
+      run:
+        path: bash
+        args: 
+        - -ce
+        - |
+          cf-for-k8s-master/hack/run-smoke-tests.sh
+
+- name: uninstall-cf
+  plan:
+  - in_parallel:
+    - get: synchronizer
+    - get: scripts
+  - task: uninstall-cf
+    params:
+      <<: *gke
+    config:
+      platform: linux
+      image_resource:
+        type: docker-image
+        source:
+          repository: relintdockerhubpushbot/cf-for-k8s-ci
+      inputs:
+      - name: scripts
+      run:
+        path: bash
+        args: 
+        - -ce
+        - |
+          bash scripts/init-gcp.sh
+          gcloud container clusters get-credentials ${CLUSTER_NAME}
+          kapp delete -a cf --yes
+          kubectl get pod -A
+
+- name: delete-cluster
+  plan:
+  - in_parallel:
+    - get: synchronizer
+      passed:
+      - uninstall-cf
+      trigger: true
+    - get: scripts
+  - task: delete-cluster
+    params:
+      <<: *gke
+    config:
+      platform: linux
+      image_resource:
+        type: docker-image
+        source:
+          repository: relintdockerhubpushbot/cf-for-k8s-ci
+      inputs:
+      - name: scripts          
+      run:
+        path: bash
+        args: 
+        - -ce
+        - |
+          bash scripts/init-gcp.sh      
+          gcloud container clusters delete ${CLUSTER_NAME} --quiet
