@@ -25,6 +25,7 @@ gcp-params: &gke
   # Kubernetes Engine Admin
   # Service Account User
   # DNS Administrator
+  # Storage Admin
   PROJECT_ID: ((project_id))
   REGION: asia-northeast1
   ZONE: asia-northeast1-c
@@ -70,8 +71,8 @@ jobs:
           bash scripts/init-gcp.sh
           gcloud container clusters create ${CLUSTER_NAME} \
             --cluster-version 1.15 \
-            --machine-type=n1-standard-2 \
-            --num-nodes 3 \
+            --machine-type=n1-standard-4 \
+            --num-nodes 2 \
             --enable-autorepair \
             --enable-network-policy \
             --metadata disable-legacy-endpoints=true \
@@ -109,7 +110,7 @@ jobs:
           bash scripts/init-gcp.sh
           gcloud container clusters get-credentials ${CLUSTER_NAME}
           cf-for-k8s-master/hack/confirm-network-policy.sh ${CLUSTER_NAME} ${ZONE}
-          cf-for-k8s-master/hack/generate-values.sh "${DNS_DOMAIN}" > cf-install-values.yml
+          cf-for-k8s-master/hack/generate-values.sh "${DNS_DOMAIN}" /tmp/gcp-service-account.json > cf-install-values.yml
           sed -i "s/cf_admin_password: .*/cf_admin_password: ${CF_ADMIN_PASSWORD}/" cf-install-values.yml
           cf-for-k8s-master/bin/install-cf.sh cf-install-values.yml
           kubectl get pod -A
@@ -163,6 +164,7 @@ jobs:
       SMOKE_TEST_API_ENDPOINT: https://api.((dns_domain))
       SMOKE_TEST_USERNAME: admin
       SMOKE_TEST_PASSWORD: ((cf_admin_password))
+      SMOKE_TEST_SKIP_SSL: true
     config:
       platform: linux
       image_resource:
